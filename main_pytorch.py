@@ -176,17 +176,58 @@ class QueryBoostMixer(nn.Module):
             nn.Linear(hidden_dim, self.mixer_dim),
         )
 
+        # RankMixer: T 个子空间各一个独立 MLP，子空间内参数共享
+        # 每个子空间: T 个 token 的 sub_dim 维拼接 → T * sub_dim = mixer_dim
+        # 不同子空间使用不同 MLP，MLP 中间层扩展比 2x
+        sub_dim = self.mixer_dim // total_tokens
+        sub_input_dim = total_tokens * sub_dim   # = mixer_dim
+        sub_hidden_dim = sub_input_dim * 2
+        self.sub_mlps = nn.ModuleList([
+            nn.Sequential(
+                nn.Linear(sub_input_dim, sub_hidden_dim),
+                nn.SiLU(),
+                nn.Linear(sub_hidden_dim, sub_input_dim),
+            )
+            for _ in range(total_tokens)
+        ])
+
     def token_mix(self, x: torch.Tensor) -> torch.Tensor:
+        """切子空间 + 跨 token 拼接 + 子空间 MLP + 还原。
+
+        流程:
+          1. 每个 token 沿通道切成 T 个子空间 → [batch, T(token), T(子空间), sub_dim]
+          2. transpose → [batch, T(子空间), T(token), sub_dim]
+          3. 同一子空间内所有 token 拼接 → [batch, T(子空间), T*sub_dim = mixer_dim]
+          4. 每个子空间过独立 MLP (子空间内参数共享，不同子空间参数不同)
+          5. 还原: [batch, T(子空间), T(token), sub_dim] → transpose → [batch, T(token), mixer_dim]
+        """
         batch_size, total_tokens, mixer_dim = x.shape
         if total_tokens != self.total_tokens:
             raise ValueError(f"Expected {self.total_tokens} tokens, but received {total_tokens}")
         sub_dim = mixer_dim // total_tokens
-        return x.view(batch_size, total_tokens, total_tokens, sub_dim).transpose(1, 2).reshape(batch_size, total_tokens, mixer_dim)
+
+        # 1-2: 切子空间并 transpose
+        x_grouped = x.view(batch_size, total_tokens, total_tokens, sub_dim).transpose(1, 2)
+        # [batch, T(子空间), T(token), sub_dim]
+
+        # 3-4: 每个子空间内，T 个 token 的 sub_dim 维拼接后过该子空间的 MLP
+        x_mixed = torch.stack([
+            mlp(x_grouped[:, i].reshape(batch_size, total_tokens * sub_dim))
+            for i, mlp in enumerate(self.sub_mlps)
+        ], dim=1)
+        # [batch, T(子空间), T*sub_dim = mixer_dim]
+
+        # 还原: 拆回每个 token 的子空间 → transpose 回 token 维度
+        x_mixed = x_mixed.view(batch_size, total_tokens, total_tokens, sub_dim).transpose(1, 2)
+        # [batch, T(token), T(子空间), sub_dim] → [batch, T(token), mixer_dim]
+        return x_mixed.reshape(batch_size, total_tokens, mixer_dim)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         residual = x
         x = self.in_proj(x)
+        # Token Mixing + 子空间 MLP
         x = self.token_mix(x)
+        # Per-Token FFN
         x = self.ffn(self.norm(x))
         x = self.out_proj(x)
         return residual + x
