@@ -188,17 +188,20 @@ class TAACHyFormerClassifier(nn.Module):
         self.sequence_position_embedding = nn.Embedding(seq_len, d_model)
         self.sequence_type_embedding = nn.Embedding(num_sequences, d_model)
 
-        # ---- Query Generator: per-sequence, ns_tokens 完整参与 ----
-        # ns_tokens [B, M, D] flatten → [B, M*D]，保留完整语义，不做 mean
-        ns_flat_dim = self.num_non_seq_tokens * d_model
-        self.ns_proj_click = nn.Sequential(nn.Linear(ns_flat_dim, ffn_hidden), nn.SiLU())
-        self.ns_proj_expo = nn.Sequential(nn.Linear(ns_flat_dim, ffn_hidden), nn.SiLU())
-        # pooled sequence [B, D] → [B, ffn_hidden]
-        self.seq_proj_click = nn.Sequential(nn.Linear(d_model, ffn_hidden), nn.SiLU())
-        self.seq_proj_expo = nn.Sequential(nn.Linear(d_model, ffn_hidden), nn.SiLU())
-        # 最终生成 query
-        self.query_gen_click = nn.Linear(ffn_hidden, num_queries_per_seq * d_model)
-        self.query_gen_expo = nn.Linear(ffn_hidden, num_queries_per_seq * d_model)
+        # Explicit global-token construction for query generation:
+        # flatten all non-seq tokens, concatenate with each pooled sequence summary,
+        # then use a branch-specific lightweight MLP to produce that branch's queries.
+        query_input_dim = self.num_non_seq_tokens * d_model + d_model
+        self.query_generators = nn.ModuleList(
+            [
+                nn.Sequential(
+                    nn.Linear(query_input_dim, ffn_hidden),
+                    nn.SiLU(),
+                    nn.Linear(ffn_hidden, num_queries_per_seq * d_model),
+                )
+                for _ in range(num_sequences)
+            ]
+        )
 
         self.backbone = HyFormerBackbone(
             num_layers=hyformer_layers,
@@ -268,19 +271,24 @@ class TAACHyFormerClassifier(nn.Module):
         non_seq_tokens: torch.Tensor,
         pooled_sequences: list[torch.Tensor],
     ) -> list[torch.Tensor]:
-        B = non_seq_tokens.size(0)
-        # ns_tokens 完整参与，flatten 保留全部语义，不做 mean
-        ns_flat = non_seq_tokens.flatten(start_dim=1)  # [B, M*D]
+        if len(pooled_sequences) != self.num_sequences:
+            raise ValueError(
+                f"Expected {self.num_sequences} pooled sequence summaries, but received {len(pooled_sequences)}"
+            )
 
-        # Click query: ns_tokens 完整语义 + click 序列池化
-        click_ctx = self.ns_proj_click(ns_flat) + self.seq_proj_click(pooled_sequences[0])
-        q_click = self.query_gen_click(click_ctx).view(B, self.num_queries_per_seq, self.d_model)
-
-        # Exposure query: ns_tokens 完整语义 + exposure 序列池化
-        expo_ctx = self.ns_proj_expo(ns_flat) + self.seq_proj_expo(pooled_sequences[1])
-        q_expo = self.query_gen_expo(expo_ctx).view(B, self.num_queries_per_seq, self.d_model)
-
-        return [q_click, q_expo]
+        batch_size = non_seq_tokens.size(0)
+        ns_flat = non_seq_tokens.flatten(start_dim=1)
+        query_tokens: list[torch.Tensor] = []
+        for seq_idx, pooled_seq in enumerate(pooled_sequences):
+            global_context = torch.cat([ns_flat, pooled_seq], dim=-1)
+            query_tokens.append(
+                self.query_generators[seq_idx](global_context).view(
+                    batch_size,
+                    self.num_queries_per_seq,
+                    self.d_model,
+                )
+            )
+        return query_tokens
 
     def forward(
         self,

@@ -238,7 +238,7 @@
    - `exposure_seq`
 2. 高基数 sparse 特征采用哈希桶而不是显式全量词表
 3. 使用共享的 step encoder，再通过 sequence type embedding 区分分支
-4. Query Generator 先维持 `non_seq pooled summary + per-seq pooled summary` 路线
+4. Query Generator 改为 `flatten(all non-seq tokens) + pooled per-seq summary` 的显式 `concat` 路线，再按分支生成 query
 
 ## 8. 这轮没有做的事
 
