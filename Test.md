@@ -1,87 +1,63 @@
-# `run_taac2026_sample.py` 命令行用法
+# 结构化输入版本命令示例
 
-## 基本训练
+## 1. 预处理
+
+默认使用 `5` 秒时间窗做事件级去重，并输出结构化 sparse/dense 张量：
 
 ```bash
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32
+python scripts/preprocess_taobao.py
 ```
 
-## 快速 CPU 检查
+快速调试：
 
 ```bash
-python scripts/run_taac2026_sample.py --max-rows 1000 --epochs 1 --batch-size 32 --device cpu --no-amp
+python scripts/preprocess_taobao.py --max-rows 50000 --seq-len 50
 ```
 
-## 训练并保存 checkpoint
+说明：`--max-rows` 会在完整时间轴上做等距抽样，而不是只截取最早的一段数据，便于保留时间切分调试语义。
 
-训练结束时会保存最后一轮 checkpoint；当验证 AUC 出现新高时，还会额外保存一份 best checkpoint。
+显式指定去重时间窗：
 
 ```bash
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --save-checkpoint
+python scripts/preprocess_taobao.py --dedup-window-sec 5
 ```
 
-## 选择序列编码器
+## 2. 训练
 
-可选值：
-
-- `longer`
-- `full_transformer`
-- `swiglu`
-
-示例：
+默认按时间切分 train / val：
 
 ```bash
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --seq-encoder-type longer
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --seq-encoder-type full_transformer
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --seq-encoder-type swiglu
+python scripts/run_taobao.py --epochs 5 --batch-size 256
 ```
 
-## 调整 token 配置
+快速 CPU 检查：
 
 ```bash
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --num-sequences 3 --global-tokens-per-seq 1 --num-non-seq-tokens 13
+python scripts/run_taobao.py --max-rows 50000 --epochs 1 --batch-size 64 --device cpu
 ```
 
-## 开启 / 关闭混合精度
+说明：训练脚本里的 `--max-rows` 同样会沿完整时间轴做等距抽样，避免小样本调试时验证集只落在最早几天。
 
-CUDA 下默认开启 AMP。
+使用随机切分做对比实验：
 
 ```bash
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --amp-dtype bf16
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --no-amp
+python scripts/run_taobao.py --split-mode random --val-ratio 0.2
 ```
 
-## 从 checkpoint 继续训练
-
-`--resume` 可以填写：
-
-- `output-dir` 下的 checkpoint 文件名
-- checkpoint 的绝对路径
-
-示例：
+按最后 1 天做验证：
 
 ```bash
-python scripts/run_taac2026_sample.py --epochs 10 --batch-size 32 --resume best_model_20260414_164500.pt
-python scripts/run_taac2026_sample.py --epochs 10 --batch-size 32 --resume best_model_20260414_164500.pt --save-checkpoint
+python scripts/run_taobao.py --split-mode time --val-days 1
 ```
 
-## 读取本地 parquet
+## 3. 常用参数
 
 ```bash
-python scripts/run_taac2026_sample.py --local-parquet D:\path\to\demo_1000.parquet --epochs 5 --batch-size 32
-```
-
-## 常用调参项
-
-```bash
-python scripts/run_taac2026_sample.py ^
+python scripts/run_taobao.py ^
   --epochs 5 ^
-  --batch-size 32 ^
-  --seq-len 16 ^
-  --num-sequences 3 ^
+  --batch-size 256 ^
   --global-tokens-per-seq 1 ^
-  --num-non-seq-tokens 13 ^
+  --num-non-seq-tokens 9 ^
   --d-model 128 ^
   --num-heads 4 ^
   --ffn-hidden 256 ^
@@ -92,8 +68,21 @@ python scripts/run_taac2026_sample.py ^
   --weight-decay 1e-4
 ```
 
-## 查看完整参数
+## 4. checkpoint
 
 ```bash
-python scripts/run_taac2026_sample.py --help
+python scripts/run_taobao.py --epochs 5 --save-checkpoint
 ```
+
+## 5. 当前预处理输出
+
+预处理完成后，`data/taobao_processed/` 下应包含：
+
+- `non_seq_sparse.pt`
+- `non_seq_dense.pt`
+- `seq_sparse.pt`
+- `seq_dense.pt`
+- `seq_mask.pt`
+- `labels.pt`
+- `timestamps.pt`
+- `metadata.json`

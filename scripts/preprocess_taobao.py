@@ -1,62 +1,41 @@
 """
-淘宝广告点击率(CTR)数据集预处理脚本
-=====================================
+淘宝广告 CTR 数据预处理脚本（结构化 sparse/dense 版本）
+=====================================================
 
-数据来源: Alimama (Taobao Display Ad Click)
-文件:
-  - raw_sample.csv: 展示/点击日志  (user, time_stamp, adgroup_id, pid, nonclk, clk)
-  - ad_feature.csv: 广告特征       (adgroup_id, cate_id, campaign_id, customer, brand, price)
-  - user_profile.csv: 用户画像     (userid, cms_segid, cms_group_id, final_gender_code,
-                                     age_level, pvalue_level, shopping_level, occupation,
-                                     new_user_class_level)
+数据来源: Alimama / Taobao Display Ad Click
 
-预处理流程:
-  1. 读取三张 CSV 并做基础清洗（缺失值填充、类型转换）
-  2. 拼接表: raw_sample LEFT JOIN ad_feature ON adgroup_id
-             raw_sample LEFT JOIN user_profile ON user=userid
-  3. 按 user 分组，按时间排序，构建两条异构行为序列:
-     - 序列0 (click_seq):    用户历史**点击**的 adgroup_id 序列 (clk=1)
-     - 序列1 (exposure_seq): 用户历史**曝光未点击**的 adgroup_id 序列 (nonclk=1)
-  4. 对当前样本提取非序列特征 (non_seq_features, 17维):
-     - 用户ID (1维): user_id
-     - 用户画像 (6维): gender, age_level, pvalue_level, shopping_level, occupation, city_level
-     - 目标广告ID (1维): adgroup_id
-     - 目标广告属性 (4维): campaign_id, customer, brand, price
-     - 广告类目 (1维): cate_id
-     - 上下文特征 (4维): pid_type, pid_id, hour_of_day, day_of_week
-  5. 输出 PyTorch tensor 并保存到 data/taobao_processed/
-     - non_seq_x: [N, 17]   (原始非序列特征，维度不限)
-     - seq_x:     [N, 2, seq_len, 1]   (2条序列，每步1个adgroup_id特征)
-     - labels:    [N]  (0=未点击, 1=点击)
+当前公开版本使用三张表:
+  - raw_sample.csv
+  - ad_feature.csv
+  - user_profile.csv
 
-Token 配置 (对齐 HyFormer 论文 16-token 设计):
-  - 原始 non_seq_dim=17 → non_seq_tokenizer (Linear) 映射到 14 个 non-seq tokens
-  - 每条序列 1 个 query token → 2 个 query tokens
-  - 14 non-seq tokens + 2 query tokens = 16 总 token
-  - 训练时: --num-sequences 2 --num-non-seq-tokens 14 --global-tokens-per-seq 1
-  - 原始特征维度与 token 数量解耦: non_seq_tokenizer 自动完成投影
+本脚本的目标:
+  1. 对 raw_sample 做 5 秒时间窗事件去重
+  2. 构造当前样本的结构化 non-seq sparse/dense 特征
+  3. 从 raw_sample 反推两条历史序列:
+       - click_seq
+       - exposure_seq
+  4. 为每个历史 step 构造结构化 sparse/dense 特征
+  5. 输出新的张量契约，供 HyFormer CTR 训练脚本使用
 
-关键设计:
-  - 非序列特征维度不限: 所有有价值的特征都放入 non_seq_x，模型内部做投影
-  - 两条异构序列: 点击 vs 曝光未点击，捕获不同行为信号
-  - 曝光未点击序列保留稀疏点击场景下的大量负反馈信息
-  - 行为序列只取当前样本时间戳之前的记录，防止数据泄漏
-  - 广告特征放 non_seq: CTR 预测 P(user 点击 ad)，广告是 query side，
-    HyFormer 的 Query Generation 用 non_seq（含广告特征）与历史行为交互
-  - 与 taac_data.py 使用相同的 squash/safe_float 函数确保特征处理一致性
-
-用法:
-  python scripts/preprocess_taobao.py
-  python scripts/preprocess_taobao.py --max-rows 100000 --seq-len 100
+输出:
+  - non_seq_sparse.pt
+  - non_seq_dense.pt
+  - seq_sparse.pt
+  - seq_dense.pt
+  - seq_mask.pt
+  - labels.pt
+  - timestamps.pt
+  - metadata.json
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import math
 from bisect import bisect_left
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
@@ -65,482 +44,768 @@ import torch
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 
+SUPPORTED_NUM_SEQUENCES = 2
+DEFAULT_DEDUP_WINDOW_SEC = 5
+CHINA_TZ_OFFSET_SEC = 8 * 3600
 
-# ---------------------------------------------------------------------------
-# 工具函数 (与 taac_data.py 保持一致)
-# ---------------------------------------------------------------------------
+NON_SEQ_SPARSE_FIELDS = [
+    "user",
+    "adgroup_id",
+    "cate_id",
+    "campaign_id",
+    "customer",
+    "brand",
+    "pid_type",
+    "pid_id",
+    "final_gender_code",
+    "age_level",
+    "pvalue_level",
+    "shopping_level",
+    "occupation",
+    "new_user_class_level",
+]
 
-def safe_float(value) -> float:
-    """将任意值转为 float，字符串做 hash 映射。"""
+NON_SEQ_DENSE_FIELDS = [
+    "price_log",
+    "hour_of_day",
+    "day_of_week",
+    "click_hist_len_log",
+    "exposure_hist_len_log",
+    "click_last_gap_log",
+    "exposure_last_gap_log",
+    "click_same_cate_count_log",
+    "exposure_same_cate_count_log",
+    "click_same_brand_count_log",
+    "exposure_same_brand_count_log",
+    "event_dup_count_log",
+    "event_cluster_span_log",
+]
+
+SEQ_SPARSE_FIELDS = [
+    "adgroup_id",
+    "cate_id",
+    "campaign_id",
+    "customer",
+    "brand",
+    "pid_type",
+    "pid_id",
+]
+
+SEQ_DENSE_FIELDS = [
+    "price_log",
+    "time_gap_log",
+    "same_ad_as_target",
+    "same_cate_as_target",
+    "same_brand_as_target",
+    "same_campaign_as_target",
+    "same_customer_as_target",
+]
+
+SPARSE_FIELD_BUCKETS = {
+    "user": 262_144,
+    "adgroup_id": 262_144,
+    "cate_id": 65_536,
+    "campaign_id": 131_072,
+    "customer": 131_072,
+    "brand": 131_072,
+    "pid_type": 4_096,
+    "pid_id": 32_768,
+    "final_gender_code": 64,
+    "age_level": 64,
+    "pvalue_level": 64,
+    "shopping_level": 64,
+    "occupation": 64,
+    "new_user_class_level": 64,
+}
+
+TOKEN_GROUPS = {
+    "user_profile_token": [
+        "final_gender_code",
+        "age_level",
+        "pvalue_level",
+        "shopping_level",
+        "occupation",
+        "new_user_class_level",
+    ],
+    "user_identity_token": ["user"],
+    "target_ad_identity_token": ["adgroup_id"],
+    "target_ad_attribute_token": ["cate_id", "campaign_id", "customer", "brand"],
+    "target_price_token": ["price_log"],
+    "context_token": ["pid_type", "pid_id", "hour_of_day", "day_of_week"],
+    "history_summary_token_click": [
+        "click_hist_len_log",
+        "click_last_gap_log",
+        "click_same_cate_count_log",
+        "click_same_brand_count_log",
+    ],
+    "history_summary_token_exposure": [
+        "exposure_hist_len_log",
+        "exposure_last_gap_log",
+        "exposure_same_cate_count_log",
+        "exposure_same_brand_count_log",
+    ],
+    "current_event_token": ["event_dup_count_log", "event_cluster_span_log"],
+}
+
+
+@dataclass
+class UserHistory:
+    click_ts: list[int]
+    click_events: list[tuple[int, int, int, int, int, float, int, int]]
+    expose_ts: list[int]
+    expose_events: list[tuple[int, int, int, int, int, float, int, int]]
+
+
+def safe_int(value: object) -> int:
+    if value is None:
+        return 0
+    if isinstance(value, (int, np.integer)):
+        return int(value)
+    if isinstance(value, float):
+        if math.isnan(value) or math.isinf(value):
+            return 0
+        return int(value)
+    if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return 0
+        try:
+            return int(float(value))
+        except ValueError:
+            return 0
+    return 0
+
+
+def safe_float(value: object) -> float:
     if value is None:
         return 0.0
-    if isinstance(value, bool):
-        return float(value)
-    if isinstance(value, (int, float)):
+    if isinstance(value, (int, float, np.integer, np.floating)):
+        value = float(value)
         if math.isnan(value) or math.isinf(value):
             return 0.0
-        return float(value)
+        return value
     if isinstance(value, str):
+        value = value.strip()
+        if not value:
+            return 0.0
         try:
-            return float(value)
+            numeric = float(value)
+            if math.isnan(numeric) or math.isinf(numeric):
+                return 0.0
+            return numeric
         except ValueError:
-            digest = hashlib.sha1(value.encode("utf-8")).hexdigest()
-            return int(digest[:12], 16) / float(16**12)
+            return 0.0
     return 0.0
 
 
-def squash(value: float) -> float:
-    """copysign(log1p(abs(x)), x) — 与 taac_data.py 中 squash_numeric 一致。"""
-    if value == 0.0:
-        return 0.0
-    return math.copysign(math.log1p(abs(value)), value)
+def log1p_nonneg(value: object) -> float:
+    numeric = safe_float(value)
+    return math.log1p(max(numeric, 0.0))
 
 
-def squash_array(arr: np.ndarray) -> np.ndarray:
-    """向量化版本的 squash。"""
-    vals = arr.astype(np.float64)
-    mask_invalid = ~np.isfinite(vals)
-    vals[mask_invalid] = 0.0
-    result = np.where(vals == 0.0, 0.0, np.copysign(np.log1p(np.abs(vals)), vals))
-    return result.astype(np.float32)
+def stable_bucket_id(value: object, bucket_size: int) -> int:
+    if bucket_size <= 0:
+        raise ValueError("bucket_size must be positive")
+    numeric = safe_int(value)
+    if numeric == 0:
+        return 0
+    return abs(numeric) % bucket_size + 1
 
 
-# ---------------------------------------------------------------------------
-# 1. 读取 & 基础清洗
-# ---------------------------------------------------------------------------
+def deduplicate_raw_sample(raw_sample: pd.DataFrame, dedup_window_sec: int) -> tuple[pd.DataFrame, dict[str, float]]:
+    print(f"[1.5/5] 进行 {dedup_window_sec} 秒时间窗事件去重 ...")
 
-def load_raw_data(data_dir: Path) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
-    """读取三张 CSV 并做基础清洗。"""
+    df = raw_sample.sort_values(["user", "adgroup_id", "pid_type", "pid_id", "time_stamp"]).reset_index(drop=True)
+    prev_keys = df[["user", "adgroup_id", "pid_type", "pid_id"]].shift()
+    same_key = (
+        (df["user"] == prev_keys["user"])
+        & (df["adgroup_id"] == prev_keys["adgroup_id"])
+        & (df["pid_type"] == prev_keys["pid_type"])
+        & (df["pid_id"] == prev_keys["pid_id"])
+    )
+    prev_ts = df["time_stamp"].shift()
+    time_gap = (df["time_stamp"] - prev_ts).fillna(dedup_window_sec + 1)
+    same_cluster = same_key & (time_gap <= dedup_window_sec)
+    cluster_id = (~same_cluster).cumsum()
+
+    deduped = (
+        df.groupby(cluster_id, sort=False)
+        .agg(
+            user=("user", "first"),
+            time_stamp=("time_stamp", "min"),
+            adgroup_id=("adgroup_id", "first"),
+            pid_type=("pid_type", "first"),
+            pid_id=("pid_id", "first"),
+            label=("label", "max"),
+            dup_count=("label", "size"),
+            cluster_span_sec=("time_stamp", lambda col: int(col.max() - col.min())),
+        )
+        .reset_index(drop=True)
+    )
+
+    before = len(df)
+    after = len(deduped)
+    avg_cluster_size = float(deduped["dup_count"].mean()) if after else 0.0
+    removed_ratio = 0.0 if before == 0 else 1.0 - after / before
+
+    print(f"  去重前样本数: {before:,}")
+    print(f"  去重后样本数: {after:,}")
+    print(f"  平均事件簇大小: {avg_cluster_size:.4f}")
+    print(f"  删除比例: {removed_ratio * 100:.2f}%")
+
+    stats = {
+        "dedup_window_sec": dedup_window_sec,
+        "rows_before_dedup": before,
+        "rows_after_dedup": after,
+        "removed_ratio": round(removed_ratio, 6),
+        "avg_cluster_size": round(avg_cluster_size, 6),
+        "max_cluster_size": int(deduped["dup_count"].max()) if after else 0,
+    }
+    return deduped, stats
+
+
+def load_raw_data(data_dir: Path, dedup_window_sec: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float]]:
     print("[1/5] 读取原始 CSV ...")
 
     raw_sample = pd.read_csv(data_dir / "raw_sample.csv")
     ad_feature = pd.read_csv(data_dir / "ad_feature.csv")
     user_profile = pd.read_csv(data_dir / "user_profile.csv")
 
-    # --- raw_sample 清洗 ---
     raw_sample["time_stamp"] = raw_sample["time_stamp"].astype(np.int64)
     raw_sample["user"] = raw_sample["user"].astype(np.int64)
     raw_sample["adgroup_id"] = raw_sample["adgroup_id"].astype(np.int64)
-    # 解析 pid 为两个数值: scenario_type, scenario_id
     pid_split = raw_sample["pid"].str.split("_", expand=True)
     raw_sample["pid_type"] = pid_split[0].astype(np.int64)
     raw_sample["pid_id"] = pid_split[1].astype(np.int64)
-    raw_sample.drop(columns=["pid"], inplace=True)
-
-    # 标签: clk=1 为点击, clk=0 为未点击; nonclk 与 clk 互补，只保留 clk
-    raw_sample.drop(columns=["nonclk"], inplace=True)
+    raw_sample.drop(columns=["pid", "nonclk"], inplace=True)
     raw_sample.rename(columns={"clk": "label"}, inplace=True)
 
-    # --- ad_feature 清洗 ---
+    deduped_raw_sample, dedup_stats = deduplicate_raw_sample(raw_sample, dedup_window_sec)
+
     ad_feature["adgroup_id"] = ad_feature["adgroup_id"].astype(np.int64)
     ad_feature["cate_id"] = ad_feature["cate_id"].astype(np.int64)
     ad_feature["campaign_id"] = ad_feature["campaign_id"].astype(np.int64)
     ad_feature["customer"] = ad_feature["customer"].astype(np.int64)
-    # brand 含 NULL 字符串，填充为 0
     ad_feature["brand"] = ad_feature["brand"].replace("NULL", np.nan)
     ad_feature["brand"] = ad_feature["brand"].fillna(0).astype(np.int64)
     ad_feature["price"] = pd.to_numeric(ad_feature["price"], errors="coerce").fillna(0.0)
 
-    # --- user_profile 清洗 ---
-    # 列名可能有尾部空格
     user_profile.columns = user_profile.columns.str.strip()
     user_profile["userid"] = user_profile["userid"].astype(np.int64)
-    # 缺失值填充为 0
-    for col in ["cms_segid", "cms_group_id", "final_gender_code",
-                "age_level", "pvalue_level", "shopping_level",
-                "occupation", "new_user_class_level"]:
+    for col in [
+        "cms_segid",
+        "cms_group_id",
+        "final_gender_code",
+        "age_level",
+        "pvalue_level",
+        "shopping_level",
+        "occupation",
+        "new_user_class_level",
+    ]:
         user_profile[col] = pd.to_numeric(user_profile[col], errors="coerce").fillna(0).astype(np.int64)
 
-    print(f"  raw_sample:  {len(raw_sample):,} 行")
-    print(f"  ad_feature:  {len(ad_feature):,} 行")
+    print(f"  raw_sample(去重后): {len(deduped_raw_sample):,} 行")
+    print(f"  ad_feature: {len(ad_feature):,} 行")
     print(f"  user_profile: {len(user_profile):,} 行")
-    return raw_sample, ad_feature, user_profile
+    return deduped_raw_sample, ad_feature, user_profile, dedup_stats
 
 
-# ---------------------------------------------------------------------------
-# 2. 拼接表
-# ---------------------------------------------------------------------------
-
-def join_tables(
-    raw_sample: pd.DataFrame,
-    ad_feature: pd.DataFrame,
-    user_profile: pd.DataFrame,
-) -> pd.DataFrame:
-    """拼接三张表。"""
-    print("[2/5] 拼接表 ...")
+def join_tables(raw_sample: pd.DataFrame, ad_feature: pd.DataFrame, user_profile: pd.DataFrame) -> pd.DataFrame:
+    print("[2/5] 关联广告特征与用户画像 ...")
     df = raw_sample.merge(ad_feature, on="adgroup_id", how="left")
     df = df.merge(user_profile, left_on="user", right_on="userid", how="left")
-    # 去掉重复的 userid 列
+
     if "userid" in df.columns:
         df.drop(columns=["userid"], inplace=True)
 
-    # 填充可能因 join 产生的 NaN
     for col in ["cate_id", "campaign_id", "customer", "brand"]:
         df[col] = df[col].fillna(0).astype(np.int64)
     df["price"] = df["price"].fillna(0.0)
-    for col in ["cms_segid", "cms_group_id", "final_gender_code",
-                "age_level", "pvalue_level", "shopping_level",
-                "occupation", "new_user_class_level"]:
+    for col in [
+        "final_gender_code",
+        "age_level",
+        "pvalue_level",
+        "shopping_level",
+        "occupation",
+        "new_user_class_level",
+    ]:
         df[col] = df[col].fillna(0).astype(np.int64)
 
-    # ------------------------------------------------------------------
-    # 去重: 数据集说明指出，以 userID+timestamp 为主键会有大量重复记录
-    # 原因: 不同类型行为数据来自不同部门，打包时存在微小时间偏差
-    # 处理策略: 按 (user, adgroup_id) 去重
-    #   - 如果同一用户对同一广告有点击记录，优先保留点击 (label=1)
-    #   - 否则保留最新的一条曝光未点击记录 (label=0)
-    # ------------------------------------------------------------------
-    before = len(df)
-    df.sort_values(["user", "adgroup_id", "label", "time_stamp"],
-                   ascending=[True, True, False, False], inplace=True)
-    df.drop_duplicates(subset=["user", "adgroup_id"], keep="first", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    after = len(df)
-    if before != after:
-        print(f"  去重: {before:,} → {after:,} (去掉 {before - after:,} 条重复记录)")
-
-    print(f"  拼接后: {len(df):,} 行, {df.shape[1]} 列")
+    print(f"  关联后样本数: {len(df):,}")
+    print(f"  字段数: {df.shape[1]}")
     return df
 
 
-# ---------------------------------------------------------------------------
-# 3. 构建用户历史行为序列 (防止数据泄漏)
-# ---------------------------------------------------------------------------
+def build_user_behavior_sequences(df: pd.DataFrame) -> dict[int, UserHistory]:
+    print("[3/5] 构造用户历史 click/exposure 序列 ...")
 
-def build_user_behavior_sequences(
-    df: pd.DataFrame,
-) -> dict[int, dict[str, list]]:
-    """
-    为每个用户构建两条异构行为序列:
-      - click_seq:    用户历史点击的 adgroup_id (label=1)
-      - exposure_seq: 用户历史曝光未点击的 adgroup_id (label=0)
+    histories: dict[int, UserHistory] = {}
+    event_cols = ["adgroup_id", "cate_id", "campaign_id", "customer", "brand", "price", "pid_type", "pid_id"]
 
-    返回:
-      {
-        user_id: {
-          "click_ts":     [int, ...],     # 点击时间戳 (已排序)
-          "click_adids":  [int, ...],     # 点击的 adgroup_id
-          "expose_ts":    [int, ...],     # 曝光未点击时间戳 (已排序)
-          "expose_adids": [int, ...],     # 曝光未点击的 adgroup_id
-        }
-      }
-    """
-    print("[3/5] 构建用户行为序列 (点击 + 曝光未点击) ...")
-
-    user_histories: dict[int, dict[str, list]] = {}
-
-    # --- 点击序列 ---
-    click_df = df[df["label"] == 1][["user", "time_stamp", "adgroup_id"]].copy()
+    click_df = df[df["label"] == 1][["user", "time_stamp"] + event_cols].copy()
     click_df.sort_values(["user", "time_stamp"], inplace=True)
-    for uid, group in click_df.groupby("user"):
-        uid = int(uid)
-        if uid not in user_histories:
-            user_histories[uid] = {"click_ts": [], "click_adids": [], "expose_ts": [], "expose_adids": []}
-        user_histories[uid]["click_ts"] = group["time_stamp"].values.tolist()
-        user_histories[uid]["click_adids"] = group["adgroup_id"].values.tolist()
+    for uid, group in click_df.groupby("user", sort=False):
+        histories[int(uid)] = UserHistory(
+            click_ts=group["time_stamp"].astype(np.int64).tolist(),
+            click_events=list(group[event_cols].itertuples(index=False, name=None)),
+            expose_ts=[],
+            expose_events=[],
+        )
 
-    # --- 曝光未点击序列 ---
-    expose_df = df[df["label"] == 0][["user", "time_stamp", "adgroup_id"]].copy()
+    expose_df = df[df["label"] == 0][["user", "time_stamp"] + event_cols].copy()
     expose_df.sort_values(["user", "time_stamp"], inplace=True)
-    for uid, group in expose_df.groupby("user"):
+    for uid, group in expose_df.groupby("user", sort=False):
         uid = int(uid)
-        if uid not in user_histories:
-            user_histories[uid] = {"click_ts": [], "click_adids": [], "expose_ts": [], "expose_adids": []}
-        user_histories[uid]["expose_ts"] = group["time_stamp"].values.tolist()
-        user_histories[uid]["expose_adids"] = group["adgroup_id"].values.tolist()
+        history = histories.get(uid)
+        if history is None:
+            histories[uid] = UserHistory(
+                click_ts=[],
+                click_events=[],
+                expose_ts=group["time_stamp"].astype(np.int64).tolist(),
+                expose_events=list(group[event_cols].itertuples(index=False, name=None)),
+            )
+        else:
+            history.expose_ts = group["time_stamp"].astype(np.int64).tolist()
+            history.expose_events = list(group[event_cols].itertuples(index=False, name=None))
 
-    # 统计
-    users_with_click = sum(1 for h in user_histories.values() if h["click_adids"])
-    users_with_expose = sum(1 for h in user_histories.values() if h["expose_adids"])
-    print(f"  总用户数: {len(user_histories):,}")
-    print(f"  有点击序列的用户: {users_with_click:,}")
-    print(f"  有曝光序列的用户: {users_with_expose:,}")
-
-    return user_histories
+    users_with_click = sum(1 for hist in histories.values() if hist.click_ts)
+    users_with_expose = sum(1 for hist in histories.values() if hist.expose_ts)
+    print(f"  用户总数: {len(histories):,}")
+    print(f"  有 click 历史的用户: {users_with_click:,}")
+    print(f"  有 exposure 历史的用户: {users_with_expose:,}")
+    return histories
 
 
-# ---------------------------------------------------------------------------
-# 4. 特征工程 & 向量化
-# ---------------------------------------------------------------------------
+def encode_sparse_values(values: dict[str, object], field_names: list[str]) -> list[int]:
+    return [stable_bucket_id(values[field], SPARSE_FIELD_BUCKETS[field]) for field in field_names]
+
+
+def encode_seq_sparse_event(event: tuple[int, int, int, int, int, float, int, int]) -> list[int]:
+    (
+        adgroup_id,
+        cate_id,
+        campaign_id,
+        customer,
+        brand,
+        _price,
+        pid_type,
+        pid_id,
+    ) = event
+    values = {
+        "adgroup_id": adgroup_id,
+        "cate_id": cate_id,
+        "campaign_id": campaign_id,
+        "customer": customer,
+        "brand": brand,
+        "pid_type": pid_type,
+        "pid_id": pid_id,
+    }
+    return [stable_bucket_id(values[field], SPARSE_FIELD_BUCKETS[field]) for field in SEQ_SPARSE_FIELDS]
+
+
+def summarize_history(
+    history_events: list[tuple[int, int, int, int, int, float, int, int]],
+    history_ts: list[int],
+    history_count: int,
+    current_ts: int,
+    target_cate: int,
+    target_brand: int,
+) -> tuple[float, float, float, float]:
+    hist_len_log = log1p_nonneg(history_count)
+    if history_ts:
+        last_gap_log = log1p_nonneg(current_ts - history_ts[-1])
+    else:
+        last_gap_log = 0.0
+
+    same_cate_count = 0
+    same_brand_count = 0
+    for event in history_events:
+        _, cate_id, _, _, brand, _, _, _ = event
+        if cate_id == target_cate:
+            same_cate_count += 1
+        if brand == target_brand:
+            same_brand_count += 1
+
+    return (
+        hist_len_log,
+        last_gap_log,
+        log1p_nonneg(same_cate_count),
+        log1p_nonneg(same_brand_count),
+    )
+
+
+def select_evenly_spaced_rows(df: pd.DataFrame, max_rows: int | None) -> pd.DataFrame:
+    if max_rows is None or max_rows >= len(df):
+        return df
+    indices = np.linspace(0, len(df) - 1, num=max_rows, dtype=np.int64)
+    indices = np.unique(indices)
+    return df.iloc[indices].reset_index(drop=True)
+
+
+def fill_sequence_branch(
+    seq_sparse_tensor: np.ndarray,
+    seq_dense_tensor: np.ndarray,
+    seq_mask_tensor: np.ndarray,
+    row_idx: int,
+    branch_idx: int,
+    selected_events: list[tuple[int, int, int, int, int, float, int, int]],
+    selected_ts: list[int],
+    current_ts: int,
+    target_adgroup: int,
+    target_cate: int,
+    target_campaign: int,
+    target_customer: int,
+    target_brand: int,
+) -> None:
+    for step_idx, (event, hist_ts) in enumerate(zip(selected_events, selected_ts)):
+        (
+            hist_adgroup,
+            hist_cate,
+            hist_campaign,
+            hist_customer,
+            hist_brand,
+            hist_price,
+            _hist_pid_type,
+            _hist_pid_id,
+        ) = event
+        seq_sparse_tensor[row_idx, branch_idx, step_idx, :] = np.asarray(encode_seq_sparse_event(event), dtype=np.int64)
+        seq_dense_tensor[row_idx, branch_idx, step_idx, :] = np.asarray(
+            [
+                log1p_nonneg(hist_price),
+                log1p_nonneg(current_ts - hist_ts),
+                float(hist_adgroup == target_adgroup),
+                float(hist_cate == target_cate),
+                float(hist_brand == target_brand),
+                float(hist_campaign == target_campaign),
+                float(hist_customer == target_customer),
+            ],
+            dtype=np.float32,
+        )
+        seq_mask_tensor[row_idx, branch_idx, step_idx] = True
+
 
 def vectorize_dataset(
     df: pd.DataFrame,
-    user_histories: dict[int, dict[str, list]],
+    user_histories: dict[int, UserHistory],
     seq_len: int,
     num_sequences: int,
     max_rows: int | None,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, dict]:
-    """
-    将 DataFrame 转为模型可用的 tensor。
+    dedup_stats: dict[str, float],
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, dict]:
+    if num_sequences != SUPPORTED_NUM_SEQUENCES:
+        raise ValueError(
+            f"当前公开三表版本只支持 {SUPPORTED_NUM_SEQUENCES} 条历史序列（click_seq + exposure_seq），"
+            f"但收到了 num_sequences={num_sequences}。"
+        )
 
-    非序列特征 (non_seq_features, 17 维):
-      - 用户ID (1维): user_id
-      - 用户画像 (6维): gender, age_level, pvalue_level, shopping_level, occupation, city_level
-      - 目标广告ID (1维): adgroup_id
-      - 目标广告属性 (4维): campaign_id, customer, brand, price
-      - 广告类目 (1维): cate_id
-      - 上下文特征 (4维): pid_type, pid_id, hour_of_day, day_of_week
-      原始特征维度与 token 数量解耦: non_seq_tokenizer (Linear) 自动投影
-      non_seq_dim=17 → 14 non-seq tokens
-
-    序列特征 (seq_x):
-      - 序列0 (click_seq):    用户在当前时间戳之前点击的 adgroup_id 序列
-      - 序列1 (exposure_seq): 用户在当前时间戳之前曝光未点击的 adgroup_id 序列
-      每个序列 1 维特征，截断/填充到 seq_len
-      => seq_x: [N, 2, seq_len, 1]
-
-    Token 配置:
-      14 non-seq tokens + 2 query tokens = 16 total (对齐论文)
-    """
-    print("[4/5] 特征向量化 ...")
-
-    if max_rows is not None:
-        df = df.head(max_rows)
+    print("[4/5] 构造结构化张量 ...")
+    df = df.sort_values("time_stamp").reset_index(drop=True)
+    df = select_evenly_spaced_rows(df, max_rows).copy()
 
     n = len(df)
-    print(f"  处理 {n:,} 条样本")
+    print(f"  处理样本数: {n:,}")
 
-    # ====================================================================
-    # A. 非序列特征 — 向量化计算
-    # ====================================================================
+    non_seq_sparse_np = np.zeros((n, len(NON_SEQ_SPARSE_FIELDS)), dtype=np.int64)
+    non_seq_dense_np = np.zeros((n, len(NON_SEQ_DENSE_FIELDS)), dtype=np.float32)
+    seq_sparse_np = np.zeros((n, num_sequences, seq_len, len(SEQ_SPARSE_FIELDS)), dtype=np.int64)
+    seq_dense_np = np.zeros((n, num_sequences, seq_len, len(SEQ_DENSE_FIELDS)), dtype=np.float32)
+    seq_mask_np = np.zeros((n, num_sequences, seq_len), dtype=bool)
+    labels_np = df["label"].astype(np.int64).to_numpy()
+    timestamps_np = df["time_stamp"].astype(np.int64).to_numpy()
 
-    # 用户ID (1维)
-    id_cols = ["user", "adgroup_id"]
-    # 用户画像 (6维)
-    user_cols = [
-        "final_gender_code", "age_level", "pvalue_level", "shopping_level",
-        "occupation", "new_user_class_level",
-    ]
-    # 目标广告属性 (4维)
-    ad_cols = ["campaign_id", "customer", "brand", "price"]
-    # 广告类目 (1维)
-    cate_cols = ["cate_id"]
-    # 上下文特征 (2维: pid)
-    ctx_cols = ["pid_type", "pid_id"]
+    users_np = df["user"].astype(np.int64).to_numpy()
+    target_adgroup_np = df["adgroup_id"].astype(np.int64).to_numpy()
+    target_cate_np = df["cate_id"].astype(np.int64).to_numpy()
+    target_campaign_np = df["campaign_id"].astype(np.int64).to_numpy()
+    target_customer_np = df["customer"].astype(np.int64).to_numpy()
+    target_brand_np = df["brand"].astype(np.int64).to_numpy()
+    profile_gender_np = df["final_gender_code"].astype(np.int64).to_numpy()
+    profile_age_np = df["age_level"].astype(np.int64).to_numpy()
+    profile_pvalue_np = df["pvalue_level"].astype(np.int64).to_numpy()
+    profile_shopping_np = df["shopping_level"].astype(np.int64).to_numpy()
+    profile_occupation_np = df["occupation"].astype(np.int64).to_numpy()
+    profile_new_user_np = df["new_user_class_level"].astype(np.int64).to_numpy()
+    pid_type_np = df["pid_type"].astype(np.int64).to_numpy()
+    pid_id_np = df["pid_id"].astype(np.int64).to_numpy()
+    price_np = df["price"].astype(np.float32).to_numpy()
+    dup_count_np = df["dup_count"].astype(np.int64).to_numpy()
+    cluster_span_np = df["cluster_span_sec"].astype(np.int64).to_numpy()
+    dt_index = pd.to_datetime(timestamps_np + CHINA_TZ_OFFSET_SEC, unit="s")
+    hour_np = (dt_index.hour.to_numpy(dtype=np.float32) / 23.0).astype(np.float32)
+    dow_np = (dt_index.dayofweek.to_numpy(dtype=np.float32) / 6.0).astype(np.float32)
 
-    non_seq_parts = [df[col].values.astype(np.float32) for col in id_cols + user_cols + cate_cols + ad_cols + ctx_cols]
+    for row_idx in range(n):
+        current_ts = int(timestamps_np[row_idx])
+        current_user = int(users_np[row_idx])
+        target_adgroup = int(target_adgroup_np[row_idx])
+        target_cate = int(target_cate_np[row_idx])
+        target_campaign = int(target_campaign_np[row_idx])
+        target_customer = int(target_customer_np[row_idx])
+        target_brand = int(target_brand_np[row_idx])
 
-    # 时间特征 — 向量化 (2维)
-    timestamps = df["time_stamp"].values.astype(np.int64)
-    dt_index = pd.to_datetime(timestamps, unit="s")
-    hours = dt_index.hour.values.astype(np.float32) / 23.0
-    dows = dt_index.dayofweek.values.astype(np.float32) / 6.0
-    non_seq_parts.append(hours)
-    non_seq_parts.append(dows)
+        history = user_histories.get(current_user)
+        if history is None:
+            click_cut = 0
+            expose_cut = 0
+            click_selected_events: list[tuple[int, int, int, int, int, float, int, int]] = []
+            click_selected_ts: list[int] = []
+            expose_selected_events = []
+            expose_selected_ts = []
+        else:
+            click_cut = bisect_left(history.click_ts, current_ts)
+            expose_cut = bisect_left(history.expose_ts, current_ts)
 
-    non_seq_np = np.column_stack(non_seq_parts)
-    non_seq_tensor = torch.from_numpy(non_seq_np)
-    non_seq_dim = non_seq_tensor.size(1)
+            click_start = max(0, click_cut - seq_len)
+            expose_start = max(0, expose_cut - seq_len)
 
-    # ====================================================================
-    # B. 序列特征 — 逐样本构建 (需要按时间截断防止数据泄漏)
-    # ====================================================================
-    seq_feature_dim = 1
-    seq_tensor = torch.zeros(n, num_sequences, seq_len, seq_feature_dim, dtype=torch.float32)
+            click_selected_events = history.click_events[click_start:click_cut]
+            click_selected_ts = history.click_ts[click_start:click_cut]
+            expose_selected_events = history.expose_events[expose_start:expose_cut]
+            expose_selected_ts = history.expose_ts[expose_start:expose_cut]
 
-    # 预提取 numpy 数组加速
-    users_np = df["user"].values
-    timestamps_np = df["time_stamp"].values
+        click_summary = summarize_history(
+            click_selected_events,
+            click_selected_ts,
+            click_cut,
+            current_ts,
+            target_cate,
+            target_brand,
+        )
+        expose_summary = summarize_history(
+            expose_selected_events,
+            expose_selected_ts,
+            expose_cut,
+            current_ts,
+            target_cate,
+            target_brand,
+        )
 
-    # 为每个用户预提取序列值 (分类ID保持原值)
-    user_seq_data: dict[int, dict[str, list]] = {}
-    for uid, hist in user_histories.items():
-        user_seq_data[uid] = {
-            "click_adids": [float(v) for v in hist["click_adids"]],
-            "click_ts": hist["click_ts"],
-            "expose_adids": [float(v) for v in hist["expose_adids"]],
-            "expose_ts": hist["expose_ts"],
+        non_seq_sparse_values = {
+            "user": current_user,
+            "adgroup_id": target_adgroup,
+            "cate_id": target_cate,
+            "campaign_id": target_campaign,
+            "customer": target_customer,
+            "brand": target_brand,
+            "pid_type": int(pid_type_np[row_idx]),
+            "pid_id": int(pid_id_np[row_idx]),
+            "final_gender_code": int(profile_gender_np[row_idx]),
+            "age_level": int(profile_age_np[row_idx]),
+            "pvalue_level": int(profile_pvalue_np[row_idx]),
+            "shopping_level": int(profile_shopping_np[row_idx]),
+            "occupation": int(profile_occupation_np[row_idx]),
+            "new_user_class_level": int(profile_new_user_np[row_idx]),
         }
+        non_seq_sparse_np[row_idx, :] = np.asarray(
+            encode_sparse_values(non_seq_sparse_values, NON_SEQ_SPARSE_FIELDS),
+            dtype=np.int64,
+        )
+        non_seq_dense_np[row_idx, :] = np.asarray(
+            [
+                log1p_nonneg(price_np[row_idx]),
+                float(hour_np[row_idx]),
+                float(dow_np[row_idx]),
+                click_summary[0],
+                expose_summary[0],
+                click_summary[1],
+                expose_summary[1],
+                click_summary[2],
+                expose_summary[2],
+                click_summary[3],
+                expose_summary[3],
+                log1p_nonneg(dup_count_np[row_idx]),
+                log1p_nonneg(cluster_span_np[row_idx]),
+            ],
+            dtype=np.float32,
+        )
 
-    for idx in range(n):
-        uid = int(users_np[idx])
-        ts = int(timestamps_np[idx])
+        fill_sequence_branch(
+            seq_sparse_np,
+            seq_dense_np,
+            seq_mask_np,
+            row_idx=row_idx,
+            branch_idx=0,
+            selected_events=click_selected_events,
+            selected_ts=click_selected_ts,
+            current_ts=current_ts,
+            target_adgroup=target_adgroup,
+            target_cate=target_cate,
+            target_campaign=target_campaign,
+            target_customer=target_customer,
+            target_brand=target_brand,
+        )
+        fill_sequence_branch(
+            seq_sparse_np,
+            seq_dense_np,
+            seq_mask_np,
+            row_idx=row_idx,
+            branch_idx=1,
+            selected_events=expose_selected_events,
+            selected_ts=expose_selected_ts,
+            current_ts=current_ts,
+            target_adgroup=target_adgroup,
+            target_cate=target_cate,
+            target_campaign=target_campaign,
+            target_customer=target_customer,
+            target_brand=target_brand,
+        )
 
-        sq = user_seq_data.get(uid)
-        if sq is None:
-            continue
+        if row_idx > 0 and row_idx % 500000 == 0:
+            print(f"    已处理 {row_idx:,}/{n:,} ...")
 
-        # --- 序列0: 点击序列 (time_stamp < ts) ---
-        click_ts = sq["click_ts"]
-        if click_ts:
-            # bisect_left 找到第一个 >= ts 的位置，即 < ts 的数量
-            cut = bisect_left(click_ts, ts)
-            if cut > 0:
-                start = max(0, cut - seq_len)
-                for s, val in enumerate(sq["click_adids"][start:cut]):
-                    seq_tensor[idx, 0, s, 0] = val
+    labels = torch.from_numpy(labels_np).long()
+    timestamps = torch.from_numpy(timestamps_np).long()
+    non_seq_sparse = torch.from_numpy(non_seq_sparse_np).long()
+    non_seq_dense = torch.from_numpy(non_seq_dense_np).float()
+    seq_sparse = torch.from_numpy(seq_sparse_np).long()
+    seq_dense = torch.from_numpy(seq_dense_np).float()
+    seq_mask = torch.from_numpy(seq_mask_np).bool()
 
-        # --- 序列1: 曝光未点击序列 (time_stamp < ts) ---
-        expose_ts = sq["expose_ts"]
-        if expose_ts:
-            cut = bisect_left(expose_ts, ts)
-            if cut > 0:
-                start = max(0, cut - seq_len)
-                for s, val in enumerate(sq["expose_adids"][start:cut]):
-                    seq_tensor[idx, 1, s, 0] = val
-
-        if idx % 500000 == 0 and idx > 0:
-            print(f"    已处理 {idx:,}/{n:,} ...")
-
-    # ====================================================================
-    # C. 标签
-    # ====================================================================
-    labels = torch.tensor(df["label"].values, dtype=torch.long)
-
-    # 统计
     pos = int(labels.sum().item())
-    neg = len(labels) - pos
-    has_click_seq = (seq_tensor[:, 0].abs().sum(dim=(1, 2)) > 0).sum().item()
-    has_expose_seq = (seq_tensor[:, 1].abs().sum(dim=(1, 2)) > 0).sum().item()
-
-    print(f"  正样本: {pos:,}  负样本: {neg:,}  正样本率: {pos/len(labels)*100:.2f}%")
-    print(f"  有点击序列的样本: {has_click_seq:,}/{n:,} ({has_click_seq/max(n,1)*100:.1f}%)")
-    print(f"  有曝光序列的样本: {has_expose_seq:,}/{n:,} ({has_expose_seq/max(n,1)*100:.1f}%)")
+    neg = int(len(labels) - pos)
+    click_non_empty = int(seq_mask[:, 0].any(dim=1).sum().item())
+    expose_non_empty = int(seq_mask[:, 1].any(dim=1).sum().item())
 
     metadata = {
-        "dataset": "taobao_ad_ctr",
+        "dataset": "taobao_ad_ctr_public_three_table",
         "num_samples": n,
-        "non_seq_dim": non_seq_dim,
         "num_sequences": num_sequences,
+        "sequence_names": ["click_seq", "exposure_seq"],
         "seq_len": seq_len,
-        "seq_feature_dim": seq_feature_dim,
-        "num_classes": 2,
         "label_mapping": {"0": 0, "1": 1},
         "positive_samples": pos,
         "negative_samples": neg,
         "pos_rate": round(pos / max(n, 1), 6),
-        "samples_with_click_seq": int(has_click_seq),
-        "samples_with_expose_seq": int(has_expose_seq),
-        "non_seq_feature_names": [
-            # 用户ID (1维)
-            "user_id",
-            # 目标广告ID (1维)
-            "adgroup_id",
-            # 用户画像 (6维)
-            "gender", "age_level", "pvalue_level", "shopping_level",
-            "occupation", "city_level",
-            # 广告类目 (1维)
-            "ad_cate_id",
-            # 目标广告属性 (4维)
-            "ad_campaign_id", "ad_customer", "ad_brand", "ad_price",
-            # 上下文特征 (4维)
-            "pid_type", "pid_id", "hour_of_day", "day_of_week",
-        ],
-        "sequence_names": ["click_seq", "exposure_seq"],
-        "token_design": {
-            "num_non_seq_tokens": 14,
-            "global_tokens_per_seq": 1,
-            "num_sequences": 2,
-            "total_tokens": 16,
+        "samples_with_click_seq": click_non_empty,
+        "samples_with_exposure_seq": expose_non_empty,
+        "non_seq_sparse_fields": NON_SEQ_SPARSE_FIELDS,
+        "non_seq_dense_fields": NON_SEQ_DENSE_FIELDS,
+        "seq_sparse_fields": SEQ_SPARSE_FIELDS,
+        "seq_dense_fields": SEQ_DENSE_FIELDS,
+        "sparse_field_cardinalities": {field: bucket_size + 1 for field, bucket_size in SPARSE_FIELD_BUCKETS.items()},
+        "token_groups": TOKEN_GROUPS,
+        "dedup": dedup_stats,
+        "time_semantics": {
+            "timezone": "Asia/Shanghai",
+            "timestamp_unit": "seconds",
+        },
+        "time_range": {
+            "min_timestamp": int(timestamps.min().item()) if n else 0,
+            "max_timestamp": int(timestamps.max().item()) if n else 0,
         },
     }
 
-    return non_seq_tensor, seq_tensor, labels, metadata
+    return non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, timestamps, metadata
 
-
-# ---------------------------------------------------------------------------
-# 5. 保存
-# ---------------------------------------------------------------------------
 
 def save_outputs(
     output_dir: Path,
-    non_seq_tensor: torch.Tensor,
-    seq_tensor: torch.Tensor,
+    non_seq_sparse: torch.Tensor,
+    non_seq_dense: torch.Tensor,
+    seq_sparse: torch.Tensor,
+    seq_dense: torch.Tensor,
+    seq_mask: torch.Tensor,
     labels: torch.Tensor,
+    timestamps: torch.Tensor,
     metadata: dict,
 ) -> None:
-    """保存处理后的 tensor 和元信息。"""
     print("[5/5] 保存输出 ...")
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    torch.save(non_seq_tensor, output_dir / "non_seq_x.pt")
-    torch.save(seq_tensor, output_dir / "seq_x.pt")
+    torch.save(non_seq_sparse, output_dir / "non_seq_sparse.pt")
+    torch.save(non_seq_dense, output_dir / "non_seq_dense.pt")
+    torch.save(seq_sparse, output_dir / "seq_sparse.pt")
+    torch.save(seq_dense, output_dir / "seq_dense.pt")
+    torch.save(seq_mask, output_dir / "seq_mask.pt")
     torch.save(labels, output_dir / "labels.pt")
+    torch.save(timestamps, output_dir / "timestamps.pt")
 
     (output_dir / "metadata.json").write_text(
-        json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8"
+        json.dumps(metadata, indent=2, ensure_ascii=False),
+        encoding="utf-8",
     )
 
-    print(f"  保存到: {output_dir}")
-    print(f"  non_seq_x: {tuple(non_seq_tensor.shape)}")
-    print(f"  seq_x:     {tuple(seq_tensor.shape)}")
-    print(f"  labels:    {tuple(labels.shape)}")
+    print(f"  输出目录: {output_dir}")
+    print(f"  non_seq_sparse: {tuple(non_seq_sparse.shape)}")
+    print(f"  non_seq_dense:  {tuple(non_seq_dense.shape)}")
+    print(f"  seq_sparse:     {tuple(seq_sparse.shape)}")
+    print(f"  seq_dense:      {tuple(seq_dense.shape)}")
+    print(f"  seq_mask:       {tuple(seq_mask.shape)}")
+    print(f"  labels:         {tuple(labels.shape)}")
+    print(f"  timestamps:     {tuple(timestamps.shape)}")
 
-
-# ---------------------------------------------------------------------------
-# Main
-# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="淘宝广告 CTR 数据集预处理")
-    parser.add_argument("--data-dir", type=Path, default=PROJECT_ROOT / "data" / "archive",
-                        help="原始 CSV 数据目录 (默认: data/archive)")
-    parser.add_argument("--output-dir", type=Path, default=PROJECT_ROOT / "data" / "taobao_processed",
-                        help="输出目录 (默认: data/taobao_processed)")
-    parser.add_argument("--max-rows", type=int, default=None,
-                        help="限制处理行数，用于快速调试 (默认: 全部)")
-    parser.add_argument("--seq-len", type=int, default=100,
-                        help="用户行为序列最大长度 (默认: 100)")
-    parser.add_argument("--num-sequences", type=int, default=2,
-                        help="行为序列数量: 2条 (点击+曝光未点击) (默认: 2)")
+    parser = argparse.ArgumentParser(description="淘宝广告 CTR 数据预处理（结构化 sparse/dense 版本）")
+    parser.add_argument(
+        "--data-dir",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "archive",
+        help="原始 CSV 数据目录（默认: data/archive）",
+    )
+    parser.add_argument(
+        "--output-dir",
+        type=Path,
+        default=PROJECT_ROOT / "data" / "taobao_processed",
+        help="输出目录（默认: data/taobao_processed）",
+    )
+    parser.add_argument(
+        "--max-rows",
+        type=int,
+        default=None,
+        help="限制处理样本数，用于快速调试（默认: 全部）",
+    )
+    parser.add_argument(
+        "--seq-len",
+        type=int,
+        default=100,
+        help="历史序列最大长度（默认: 100）",
+    )
+    parser.add_argument(
+        "--num-sequences",
+        type=int,
+        default=2,
+        help="历史序列数量，当前公开三表版本固定支持 2（click + exposure）",
+    )
+    parser.add_argument(
+        "--dedup-window-sec",
+        type=int,
+        default=DEFAULT_DEDUP_WINDOW_SEC,
+        help="事件级去重时间窗口，单位秒（默认: 5）",
+    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    cache_dir = args.output_dir / "_cache"
 
-    # ------------------------------------------------------------------
-    # 步骤 1-3 (读取、拼接、构建行为序列) 较慢，结果缓存到磁盘
-    # 后续只调 --max-rows 时可跳过，直接加载缓存
-    # ------------------------------------------------------------------
-    cache_df = cache_dir / "joined_df.parquet"
-    cache_hist = cache_dir / "user_histories.json"
+    raw_sample, ad_feature, user_profile, dedup_stats = load_raw_data(args.data_dir, args.dedup_window_sec)
+    df = join_tables(raw_sample, ad_feature, user_profile)
+    user_histories = build_user_behavior_sequences(df)
 
-    if cache_df.exists() and cache_hist.exists():
-        print("[缓存] 发现缓存文件，跳过读取/拼接/构建序列 ...")
-        df = pd.read_parquet(cache_df)
-        with open(cache_hist, encoding="utf-8") as f:
-            user_histories_raw = json.load(f)
-        # JSON 的 key 是字符串，转回 int
-        user_histories = {int(k): v for k, v in user_histories_raw.items()}
-        print(f"  df: {len(df):,} 行")
-        print(f"  用户行为序列: {len(user_histories):,} 个用户")
-    else:
-        # 1. 读取原始数据
-        raw_sample, ad_feature, user_profile = load_raw_data(args.data_dir)
-
-        # 2. 拼接
-        df = join_tables(raw_sample, ad_feature, user_profile)
-
-        # 3. 构建用户行为序列
-        user_histories = build_user_behavior_sequences(df)
-
-        # 保存缓存
-        cache_dir.mkdir(parents=True, exist_ok=True)
-        df.to_parquet(cache_df, index=False)
-        # JSON key 必须是字符串
-        user_histories_str = {str(k): v for k, v in user_histories.items()}
-        cache_hist.write_text(
-            json.dumps(user_histories_str, ensure_ascii=False), encoding="utf-8"
-        )
-        print(f"[缓存] 已保存到 {cache_dir}")
-
-    # 4. 向量化 (受 --max-rows 影响，每次都重新执行)
-    non_seq_tensor, seq_tensor, labels, metadata = vectorize_dataset(
-        df, user_histories,
+    non_seq_sparse, non_seq_dense, seq_sparse, seq_dense, seq_mask, labels, timestamps, metadata = vectorize_dataset(
+        df=df,
+        user_histories=user_histories,
         seq_len=args.seq_len,
         num_sequences=args.num_sequences,
         max_rows=args.max_rows,
+        dedup_stats=dedup_stats,
     )
 
-    # 5. 保存
-    save_outputs(args.output_dir, non_seq_tensor, seq_tensor, labels, metadata)
+    save_outputs(
+        output_dir=args.output_dir,
+        non_seq_sparse=non_seq_sparse,
+        non_seq_dense=non_seq_dense,
+        seq_sparse=seq_sparse,
+        seq_dense=seq_dense,
+        seq_mask=seq_mask,
+        labels=labels,
+        timestamps=timestamps,
+        metadata=metadata,
+    )
 
-    print("\n[完成] 预处理结束。可以使用以下命令训练:")
+    print("\n[完成] 预处理结束，可直接进入训练。")
     print(f"  python scripts/run_taobao.py --data-dir {args.output_dir}")
-    print(f"\n快速调试:")
-    print(f"  python scripts/run_taobao.py --data-dir {args.output_dir} --max-rows 50000 --epochs 3")
 
 
 if __name__ == "__main__":
