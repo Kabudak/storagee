@@ -132,8 +132,8 @@ class TAACHyFormerClassifier(nn.Module):
         num_classes: int,
         seq_len: int,
         num_sequences: int,
-        global_tokens_per_seq: int,
         num_non_seq_tokens: int,
+        num_queries_per_seq: int,
         d_model: int,
         num_heads: int,
         ffn_hidden: int,
@@ -145,7 +145,7 @@ class TAACHyFormerClassifier(nn.Module):
         super().__init__()
         self.seq_len = seq_len
         self.num_sequences = num_sequences
-        self.global_tokens_per_seq = global_tokens_per_seq
+        self.num_queries_per_seq = num_queries_per_seq
         self.d_model = d_model
         self.token_groups = token_groups
 
@@ -188,22 +188,22 @@ class TAACHyFormerClassifier(nn.Module):
         self.sequence_position_embedding = nn.Embedding(seq_len, d_model)
         self.sequence_type_embedding = nn.Embedding(num_sequences, d_model)
 
-        global_info_dim = d_model * (num_sequences + 1)
-        self.query_generators = nn.ModuleList(
-            [
-                nn.Sequential(
-                    nn.Linear(global_info_dim, ffn_hidden),
-                    nn.SiLU(),
-                    nn.Linear(ffn_hidden, global_tokens_per_seq * d_model),
-                )
-                for _ in range(num_sequences)
-            ]
-        )
+        # ---- Query Generator: per-sequence, ns_tokens 完整参与 ----
+        # ns_tokens [B, M, D] flatten → [B, M*D]，保留完整语义，不做 mean
+        ns_flat_dim = self.num_non_seq_tokens * d_model
+        self.ns_proj_click = nn.Sequential(nn.Linear(ns_flat_dim, ffn_hidden), nn.SiLU())
+        self.ns_proj_expo = nn.Sequential(nn.Linear(ns_flat_dim, ffn_hidden), nn.SiLU())
+        # pooled sequence [B, D] → [B, ffn_hidden]
+        self.seq_proj_click = nn.Sequential(nn.Linear(d_model, ffn_hidden), nn.SiLU())
+        self.seq_proj_expo = nn.Sequential(nn.Linear(d_model, ffn_hidden), nn.SiLU())
+        # 最终生成 query
+        self.query_gen_click = nn.Linear(ffn_hidden, num_queries_per_seq * d_model)
+        self.query_gen_expo = nn.Linear(ffn_hidden, num_queries_per_seq * d_model)
 
         self.backbone = HyFormerBackbone(
             num_layers=hyformer_layers,
             num_sequences=num_sequences,
-            num_queries_per_sequence=global_tokens_per_seq,
+            num_queries_per_sequence=num_queries_per_seq,
             num_non_seq_tokens=self.num_non_seq_tokens,
             d_model=d_model,
             num_heads=num_heads,
@@ -268,11 +268,19 @@ class TAACHyFormerClassifier(nn.Module):
         non_seq_tokens: torch.Tensor,
         pooled_sequences: list[torch.Tensor],
     ) -> list[torch.Tensor]:
-        global_context = torch.cat([non_seq_tokens.mean(dim=1)] + pooled_sequences, dim=-1)
-        return [
-            generator(global_context).view(non_seq_tokens.size(0), self.global_tokens_per_seq, self.d_model)
-            for generator in self.query_generators
-        ]
+        B = non_seq_tokens.size(0)
+        # ns_tokens 完整参与，flatten 保留全部语义，不做 mean
+        ns_flat = non_seq_tokens.flatten(start_dim=1)  # [B, M*D]
+
+        # Click query: ns_tokens 完整语义 + click 序列池化
+        click_ctx = self.ns_proj_click(ns_flat) + self.seq_proj_click(pooled_sequences[0])
+        q_click = self.query_gen_click(click_ctx).view(B, self.num_queries_per_seq, self.d_model)
+
+        # Exposure query: ns_tokens 完整语义 + exposure 序列池化
+        expo_ctx = self.ns_proj_expo(ns_flat) + self.seq_proj_expo(pooled_sequences[1])
+        q_expo = self.query_gen_expo(expo_ctx).view(B, self.num_queries_per_seq, self.d_model)
+
+        return [q_click, q_expo]
 
     def forward(
         self,

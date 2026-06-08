@@ -202,7 +202,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-rows", type=int, default=None)
     parser.add_argument("--seq-len", type=int, default=100)
     parser.add_argument("--num-sequences", type=int, default=2)
-    parser.add_argument("--global-tokens-per-seq", type=int, default=1)
+    parser.add_argument("--num-queries-per-seq", type=int, default=8)
     parser.add_argument("--num-non-seq-tokens", type=int, default=9)
     parser.add_argument("--d-model", type=int, default=128)
     parser.add_argument("--num-heads", type=int, default=4)
@@ -300,7 +300,7 @@ def main() -> None:
         num_classes=1,
         seq_len=int(data_meta["seq_len"]),
         num_sequences=int(data_meta["num_sequences"]),
-        global_tokens_per_seq=args.global_tokens_per_seq,
+        num_queries_per_seq=args.num_queries_per_seq,
         num_non_seq_tokens=args.num_non_seq_tokens,
         d_model=args.d_model,
         num_heads=args.num_heads,

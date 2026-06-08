@@ -264,7 +264,7 @@ def deduplicate_raw_sample(raw_sample: pd.DataFrame, dedup_window_sec: int) -> t
     return deduped, stats
 
 
-def load_raw_data(data_dir: Path, dedup_window_sec: int) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float]]:
+def load_raw_data(data_dir: Path, dedup_window_sec: int, max_raw_rows: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float]]:
     print("[1/5] 读取原始 CSV ...")
 
     raw_sample = pd.read_csv(data_dir / "raw_sample.csv")
@@ -279,6 +279,10 @@ def load_raw_data(data_dir: Path, dedup_window_sec: int) -> tuple[pd.DataFrame, 
     raw_sample["pid_id"] = pid_split[1].astype(np.int64)
     raw_sample.drop(columns=["pid", "nonclk"], inplace=True)
     raw_sample.rename(columns={"clk": "label"}, inplace=True)
+
+    if max_raw_rows is not None and max_raw_rows < len(raw_sample):
+        raw_sample = raw_sample.sample(n=max_raw_rows, random_state=42).reset_index(drop=True)
+        print(f"  raw_sample 提前采样: {max_raw_rows:,} 行")
 
     deduped_raw_sample, dedup_stats = deduplicate_raw_sample(raw_sample, dedup_window_sec)
 
@@ -750,10 +754,16 @@ def parse_args() -> argparse.Namespace:
         help="输出目录（默认: data/taobao_processed）",
     )
     parser.add_argument(
+        "--max-raw-rows",
+        type=int,
+        default=None,
+        help="在去重前就从 raw_sample 截取的行数，用于快速调试（默认: 全部）",
+    )
+    parser.add_argument(
         "--max-rows",
         type=int,
         default=None,
-        help="限制处理样本数，用于快速调试（默认: 全部）",
+        help="去重后限制处理样本数，用于快速调试（默认: 全部）",
     )
     parser.add_argument(
         "--seq-len",
@@ -779,7 +789,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     args = parse_args()
 
-    raw_sample, ad_feature, user_profile, dedup_stats = load_raw_data(args.data_dir, args.dedup_window_sec)
+    raw_sample, ad_feature, user_profile, dedup_stats = load_raw_data(args.data_dir, args.dedup_window_sec, args.max_raw_rows)
     df = join_tables(raw_sample, ad_feature, user_profile)
     user_histories = build_user_behavior_sequences(df)
 
