@@ -69,16 +69,17 @@ Runnable entrypoints live here.
 
 Current file:
 
-- `scripts/run_taac2026_sample.py`
+- `scripts/preprocess_taobao.py`
+- `scripts/run_taobao.py`
 
-This script is the main training entrypoint. It handles:
+These scripts are the current Taobao three-table preprocessing and training entrypoints. They handle:
 
-- dataset download or local parquet reading
-- feature tensorization
+- reading `raw_sample.csv`, `ad_feature.csv`, and `user_profile.csv`
+- reconstructing click/exposure histories from prior `raw_sample` rows
+- structured sparse/dense tensorization
 - HyFormer model construction
-- AMP setup
 - training and validation loops
-- checkpoint save and resume
+- metadata and optional checkpoint save
 
 ## Backbone Architecture
 
@@ -87,7 +88,7 @@ At a high level, the model flow is:
 1. Map non-sequential features into `num_non_seq_tokens` feature tokens.
 2. Group sequential features into `num_sequences` behavior branches.
 3. Map each behavior branch into its own sequence tokens.
-4. Generate `global_tokens_per_seq` query/global tokens for each sequence branch.
+4. Generate `num_queries_per_seq` query/global tokens for each sequence branch.
 5. Alternate:
    - `Query Decoding`: each sequence branch's query tokens cross-attend to its own sequence representation
    - `Query Boosting`: decoded query tokens from all sequences and non-sequence tokens are mixed together
@@ -104,10 +105,10 @@ At a high level, the model flow is:
 
 Initial queries are generated from:
 
-- the raw non-sequential feature vector
+- the non-sequential token set
 - mean-pooled summaries from every sequence branch
 
-The current implementation passes global information through one MLP generator per sequence branch. Each generator produces `global_tokens_per_seq` query/global tokens, and these tokens are reused and updated across HyFormer layers.
+The current implementation passes global information through one MLP generator per sequence branch. The global context is built from all non-sequential tokens and pooled summaries from every sequence branch. Each generator produces `num_queries_per_seq` query/global tokens, and these tokens are reused and updated across HyFormer layers.
 
 ### Sequence Representation Encoding
 
@@ -137,64 +138,32 @@ within every HyFormer layer.
 
 ## Data Tensorization
 
-The original TAAC sample data does not explicitly expose the same production multi-sequence semantics described in the paper. To keep the project runnable on the public sample while preserving the HyFormer interface, this repository groups detected sequence features into multiple branches automatically.
+The public Taobao display-ad data used here usually exposes three CSV files rather than the richer behavior log used in the paper. The preprocessing script therefore:
 
-Current behavior:
+- joins `raw_sample.csv` with ad and user-profile features
+- builds non-sequential sparse/dense fields for the target impression
+- reconstructs two explicit sequence branches from earlier `raw_sample` rows:
+  - `click_seq`
+  - `exposure_seq`
+- emits structured sparse/dense tensors plus metadata under `data/taobao_processed`
 
-- flattened schema:
-  uses `domain_*` columns as sequence channels
-- raw schema:
-  uses parsed sequence feature names from `seq_feature`
-- grouping:
-  evenly assigns detected sequence channels into `--num-sequences` groups
-
-This keeps the training script faithful to the paper's multi-sequence interface while remaining runnable on the available sample data.
+This is a practical adaptation of the HyFormer multi-sequence interface. It is not identical to the paper's original behavior-log setting.
 
 ## Training Pipeline
 
-The current training target is the Hugging Face dataset:
+The current training target is the public Taobao display-ad click data in its common three-table form:
 
-- `TAAC2026/data_sample_1000`
+- `raw_sample.csv`
+- `ad_feature.csv`
+- `user_profile.csv`
 
-The training script supports:
-
-- remote dataset loading
-- local parquet loading
-- automatic schema handling
-- multi-sequence grouping
-- mixed precision training on CUDA
-- checkpoint save with timestamp-based filenames
-- checkpoint resume with optimizer and scaler state restoration
-
-### Mixed Precision
-
-AMP is enabled by default on CUDA.
-
-Supported modes:
-
-- default CUDA AMP
-- `--amp-dtype fp16`
-- `--amp-dtype bf16`
-- `--no-amp`
+Because this public version does not usually include `raw_behavior_log`, click/exposure sequence branches are reconstructed from earlier rows in `raw_sample`. This preserves the HyFormer multi-sequence interface, but it is not semantically identical to the paper's richer behavior-log setting.
 
 ### Checkpointing
 
-Checkpoints are saved with timestamped filenames such as:
+When `--save-checkpoint` is set, the current training script saves the best model by validation AUC with a filename such as:
 
-- `best_model_20260414_164500.pt`
-
-Resume behavior:
-
-- `--resume` accepts either a filename under `output-dir`
-- or a full checkpoint path
-
-The script restores:
-
-- model weights
-- optimizer state
-- scaler state
-- last completed epoch
-- best validation AUC
+- `best_model_epoch03_auc0.6123.pt`
 
 ## Recommended Entry Points
 
@@ -209,21 +178,16 @@ This runs a small synthetic demo and prints the shape transitions through the ba
 ### Training run
 
 ```bash
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32
+python scripts/preprocess_taobao.py
+python scripts/run_taobao.py --epochs 5 --batch-size 256
 ```
 
 ### Training with a specific sequence encoder
 
 ```bash
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --seq-encoder-type longer
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --seq-encoder-type full_transformer
-python scripts/run_taac2026_sample.py --epochs 5 --batch-size 32 --seq-encoder-type swiglu
-```
-
-### Resume training
-
-```bash
-python scripts/run_taac2026_sample.py --epochs 10 --batch-size 32 --resume best_model_20260414_164500.pt --save-checkpoint
+python scripts/run_taobao.py --epochs 5 --batch-size 256 --seq-encoder-type longer
+python scripts/run_taobao.py --epochs 5 --batch-size 256 --seq-encoder-type full_transformer
+python scripts/run_taobao.py --epochs 5 --batch-size 256 --seq-encoder-type swiglu
 ```
 
 ## What This README Tries To Clarify
@@ -238,4 +202,4 @@ If you are trying to understand where a piece of code lives:
 
 - start with `main_pytorch.py` for the architectural core
 - then read `models/taac_hyformer.py` for the task wrapper
-- then read `scripts/run_taac2026_sample.py` for the training workflow
+- then read `scripts/preprocess_taobao.py` and `scripts/run_taobao.py` for the data and training workflow

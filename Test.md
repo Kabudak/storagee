@@ -56,7 +56,7 @@ python scripts/run_taobao.py --split-mode time --val-days 1
 python scripts/run_taobao.py ^
   --epochs 5 ^
   --batch-size 256 ^
-  --global-tokens-per-seq 1 ^
+  --num-queries-per-seq 8 ^
   --num-non-seq-tokens 9 ^
   --d-model 128 ^
   --num-heads 4 ^

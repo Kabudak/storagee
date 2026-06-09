@@ -25,7 +25,17 @@ class SemanticTokenBuilder(nn.Module):
         self.sparse_fields = sparse_fields
         self.dense_fields = dense_fields
 
-        self.sparse_proj = nn.Linear(field_embed_dim, d_model) if sparse_fields else None
+        if sparse_fields:
+            self.sparse_field_offsets = nn.Parameter(torch.zeros(len(sparse_fields), field_embed_dim))
+            self.sparse_proj = nn.Sequential(
+                nn.Linear(len(sparse_fields) * field_embed_dim, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.sparse_field_offsets = None
+            self.sparse_proj = None
+
         self.dense_proj = (
             nn.Sequential(
                 nn.Linear(len(dense_fields), d_model),
@@ -47,14 +57,16 @@ class SemanticTokenBuilder(nn.Module):
     ) -> torch.Tensor:
         batch_size = non_seq_sparse.size(0)
         device = non_seq_sparse.device
-        output = torch.zeros(batch_size, self.norm.normalized_shape[0], device=device, dtype=torch.float32)
+        output = torch.zeros(batch_size, self.norm.normalized_shape[0], device=device, dtype=self.norm.weight.dtype)
 
         if self.sparse_fields:
             sparse_parts = [
                 sparse_embeddings[field](non_seq_sparse[:, sparse_index[field]])
                 for field in self.sparse_fields
             ]
-            sparse_repr = torch.stack(sparse_parts, dim=1).mean(dim=1)
+            sparse_stack = torch.stack(sparse_parts, dim=1)
+            sparse_stack = sparse_stack + self.sparse_field_offsets.unsqueeze(0)
+            sparse_repr = sparse_stack.flatten(start_dim=1)
             output = output + self.sparse_proj(sparse_repr)
 
         if self.dense_fields:
@@ -78,7 +90,17 @@ class StructuredSequenceStepEncoder(nn.Module):
         super().__init__()
         self.sparse_fields = sparse_fields
         self.dense_fields = dense_fields
-        self.sparse_proj = nn.Linear(field_embed_dim, d_model) if sparse_fields else None
+        if sparse_fields:
+            self.sparse_field_offsets = nn.Parameter(torch.zeros(len(sparse_fields), field_embed_dim))
+            self.sparse_proj = nn.Sequential(
+                nn.Linear(len(sparse_fields) * field_embed_dim, d_model),
+                nn.SiLU(),
+                nn.Linear(d_model, d_model),
+            )
+        else:
+            self.sparse_field_offsets = None
+            self.sparse_proj = None
+
         self.dense_proj = (
             nn.Sequential(
                 nn.Linear(len(dense_fields), d_model),
@@ -100,14 +122,22 @@ class StructuredSequenceStepEncoder(nn.Module):
     ) -> torch.Tensor:
         batch_size, seq_len, _ = seq_sparse.shape
         device = seq_sparse.device
-        output = torch.zeros(batch_size, seq_len, self.norm.normalized_shape[0], device=device, dtype=torch.float32)
+        output = torch.zeros(
+            batch_size,
+            seq_len,
+            self.norm.normalized_shape[0],
+            device=device,
+            dtype=self.norm.weight.dtype,
+        )
 
         if self.sparse_fields:
             sparse_parts = [
                 sparse_embeddings[field](seq_sparse[:, :, sparse_index[field]])
                 for field in self.sparse_fields
             ]
-            sparse_repr = torch.stack(sparse_parts, dim=2).mean(dim=2)
+            sparse_stack = torch.stack(sparse_parts, dim=2)
+            sparse_stack = sparse_stack + self.sparse_field_offsets.view(1, 1, len(self.sparse_fields), -1)
+            sparse_repr = sparse_stack.flatten(start_dim=2)
             output = output + self.sparse_proj(sparse_repr)
 
         if self.dense_fields:
@@ -188,10 +218,9 @@ class TAACHyFormerClassifier(nn.Module):
         self.sequence_position_embedding = nn.Embedding(seq_len, d_model)
         self.sequence_type_embedding = nn.Embedding(num_sequences, d_model)
 
-        # Explicit global-token construction for query generation:
-        # flatten all non-seq tokens, concatenate with each pooled sequence summary,
-        # then use a branch-specific lightweight MLP to produce that branch's queries.
-        query_input_dim = self.num_non_seq_tokens * d_model + d_model
+        # Query generation uses the non-seq token set plus all pooled sequence
+        # summaries, so every branch starts from a multi-sequence global context.
+        query_input_dim = (self.num_non_seq_tokens + num_sequences) * d_model
         self.query_generators = nn.ModuleList(
             [
                 nn.Sequential(
@@ -278,9 +307,10 @@ class TAACHyFormerClassifier(nn.Module):
 
         batch_size = non_seq_tokens.size(0)
         ns_flat = non_seq_tokens.flatten(start_dim=1)
+        sequence_context = torch.cat(pooled_sequences, dim=-1)
+        global_context = torch.cat([ns_flat, sequence_context], dim=-1)
         query_tokens: list[torch.Tensor] = []
-        for seq_idx, pooled_seq in enumerate(pooled_sequences):
-            global_context = torch.cat([ns_flat, pooled_seq], dim=-1)
+        for seq_idx in range(self.num_sequences):
             query_tokens.append(
                 self.query_generators[seq_idx](global_context).view(
                     batch_size,

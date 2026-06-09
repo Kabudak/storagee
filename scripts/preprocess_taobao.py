@@ -73,10 +73,16 @@ NON_SEQ_DENSE_FIELDS = [
     "exposure_hist_len_log",
     "click_last_gap_log",
     "exposure_last_gap_log",
+    "click_same_ad_count_log",
+    "exposure_same_ad_count_log",
     "click_same_cate_count_log",
     "exposure_same_cate_count_log",
     "click_same_brand_count_log",
     "exposure_same_brand_count_log",
+    "click_same_campaign_count_log",
+    "exposure_same_campaign_count_log",
+    "click_same_customer_count_log",
+    "exposure_same_customer_count_log",
     "event_dup_count_log",
     "event_cluster_span_log",
 ]
@@ -93,23 +99,27 @@ SEQ_SPARSE_FIELDS = [
 
 SEQ_DENSE_FIELDS = [
     "price_log",
+    "price_delta_log",
+    "price_ratio_log",
     "time_gap_log",
     "same_ad_as_target",
     "same_cate_as_target",
     "same_brand_as_target",
     "same_campaign_as_target",
     "same_customer_as_target",
+    "recency_rank_log",
+    "relative_position",
 ]
 
 SPARSE_FIELD_BUCKETS = {
-    "user": 262_144,
-    "adgroup_id": 262_144,
-    "cate_id": 65_536,
-    "campaign_id": 131_072,
-    "customer": 131_072,
-    "brand": 131_072,
+    "user": 524_288,
+    "adgroup_id": 524_288,
+    "cate_id": 131_072,
+    "campaign_id": 262_144,
+    "customer": 262_144,
+    "brand": 262_144,
     "pid_type": 4_096,
-    "pid_id": 32_768,
+    "pid_id": 65_536,
     "final_gender_code": 64,
     "age_level": 64,
     "pvalue_level": 64,
@@ -135,14 +145,20 @@ TOKEN_GROUPS = {
     "history_summary_token_click": [
         "click_hist_len_log",
         "click_last_gap_log",
+        "click_same_ad_count_log",
         "click_same_cate_count_log",
         "click_same_brand_count_log",
+        "click_same_campaign_count_log",
+        "click_same_customer_count_log",
     ],
     "history_summary_token_exposure": [
         "exposure_hist_len_log",
         "exposure_last_gap_log",
+        "exposure_same_ad_count_log",
         "exposure_same_cate_count_log",
         "exposure_same_brand_count_log",
+        "exposure_same_campaign_count_log",
+        "exposure_same_customer_count_log",
     ],
     "current_event_token": ["event_dup_count_log", "event_cluster_span_log"],
 }
@@ -201,6 +217,13 @@ def safe_float(value: object) -> float:
 def log1p_nonneg(value: object) -> float:
     numeric = safe_float(value)
     return math.log1p(max(numeric, 0.0))
+
+
+def signed_log1p(value: object) -> float:
+    numeric = safe_float(value)
+    if numeric == 0.0:
+        return 0.0
+    return math.copysign(math.log1p(abs(numeric)), numeric)
 
 
 def stable_bucket_id(value: object, bucket_size: int) -> int:
@@ -412,29 +435,44 @@ def summarize_history(
     history_ts: list[int],
     history_count: int,
     current_ts: int,
+    target_adgroup: int,
     target_cate: int,
+    target_campaign: int,
+    target_customer: int,
     target_brand: int,
-) -> tuple[float, float, float, float]:
+) -> tuple[float, float, float, float, float, float, float]:
     hist_len_log = log1p_nonneg(history_count)
     if history_ts:
         last_gap_log = log1p_nonneg(current_ts - history_ts[-1])
     else:
         last_gap_log = 0.0
 
+    same_ad_count = 0
     same_cate_count = 0
     same_brand_count = 0
+    same_campaign_count = 0
+    same_customer_count = 0
     for event in history_events:
-        _, cate_id, _, _, brand, _, _, _ = event
+        adgroup_id, cate_id, campaign_id, customer, brand, _, _, _ = event
+        if adgroup_id == target_adgroup:
+            same_ad_count += 1
         if cate_id == target_cate:
             same_cate_count += 1
         if brand == target_brand:
             same_brand_count += 1
+        if campaign_id == target_campaign:
+            same_campaign_count += 1
+        if customer == target_customer:
+            same_customer_count += 1
 
     return (
         hist_len_log,
         last_gap_log,
+        log1p_nonneg(same_ad_count),
         log1p_nonneg(same_cate_count),
         log1p_nonneg(same_brand_count),
+        log1p_nonneg(same_campaign_count),
+        log1p_nonneg(same_customer_count),
     )
 
 
@@ -460,7 +498,9 @@ def fill_sequence_branch(
     target_campaign: int,
     target_customer: int,
     target_brand: int,
+    target_price: float,
 ) -> None:
+    selected_len = len(selected_events)
     for step_idx, (event, hist_ts) in enumerate(zip(selected_events, selected_ts)):
         (
             hist_adgroup,
@@ -472,16 +512,24 @@ def fill_sequence_branch(
             _hist_pid_type,
             _hist_pid_id,
         ) = event
+        hist_price = safe_float(hist_price)
+        target_price = safe_float(target_price)
+        price_ratio_log = math.log1p(hist_price / target_price) if target_price > 0.0 else 0.0
+        relative_position = 0.0 if selected_len <= 1 else step_idx / (selected_len - 1)
         seq_sparse_tensor[row_idx, branch_idx, step_idx, :] = np.asarray(encode_seq_sparse_event(event), dtype=np.int64)
         seq_dense_tensor[row_idx, branch_idx, step_idx, :] = np.asarray(
             [
                 log1p_nonneg(hist_price),
+                signed_log1p(hist_price - target_price),
+                price_ratio_log,
                 log1p_nonneg(current_ts - hist_ts),
                 float(hist_adgroup == target_adgroup),
                 float(hist_cate == target_cate),
                 float(hist_brand == target_brand),
                 float(hist_campaign == target_campaign),
                 float(hist_customer == target_customer),
+                log1p_nonneg(selected_len - step_idx),
+                float(relative_position),
             ],
             dtype=np.float32,
         )
@@ -572,7 +620,10 @@ def vectorize_dataset(
             click_selected_ts,
             click_cut,
             current_ts,
+            target_adgroup,
             target_cate,
+            target_campaign,
+            target_customer,
             target_brand,
         )
         expose_summary = summarize_history(
@@ -580,7 +631,10 @@ def vectorize_dataset(
             expose_selected_ts,
             expose_cut,
             current_ts,
+            target_adgroup,
             target_cate,
+            target_campaign,
+            target_customer,
             target_brand,
         )
 
@@ -617,6 +671,12 @@ def vectorize_dataset(
                 expose_summary[2],
                 click_summary[3],
                 expose_summary[3],
+                click_summary[4],
+                expose_summary[4],
+                click_summary[5],
+                expose_summary[5],
+                click_summary[6],
+                expose_summary[6],
                 log1p_nonneg(dup_count_np[row_idx]),
                 log1p_nonneg(cluster_span_np[row_idx]),
             ],
@@ -637,6 +697,7 @@ def vectorize_dataset(
             target_campaign=target_campaign,
             target_customer=target_customer,
             target_brand=target_brand,
+            target_price=float(price_np[row_idx]),
         )
         fill_sequence_branch(
             seq_sparse_np,
@@ -652,6 +713,7 @@ def vectorize_dataset(
             target_campaign=target_campaign,
             target_customer=target_customer,
             target_brand=target_brand,
+            target_price=float(price_np[row_idx]),
         )
 
         if row_idx > 0 and row_idx % 500000 == 0:
@@ -672,6 +734,13 @@ def vectorize_dataset(
 
     metadata = {
         "dataset": "taobao_ad_ctr_public_three_table",
+        "feature_version": "field_aware_hyformer_v2",
+        "history_source": {
+            "source_table": "raw_sample",
+            "available_tables": ["raw_sample", "ad_feature", "user_profile"],
+            "sequence_names": ["click_seq", "exposure_seq"],
+            "note": "Histories are reconstructed from prior ad display/click rows, not from raw_behavior_log.",
+        },
         "num_samples": n,
         "num_sequences": num_sequences,
         "sequence_names": ["click_seq", "exposure_seq"],
