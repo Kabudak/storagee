@@ -14,6 +14,12 @@ python scripts/preprocess_taobao.py
 python scripts/preprocess_taobao.py --max-rows 50000 --seq-len 50
 ```
 
+只训练 2000 条目标样本、但先用更大的 raw_sample 窗口构造历史：
+
+```bash
+python scripts/preprocess_taobao.py --max-raw-rows 100000 --max-rows 2000 --seq-len 50 --output-dir data/taobao_processed_2000_hist100k
+```
+
 说明：`--max-rows` 会在完整时间轴上做等距抽样，而不是只截取最早的一段数据，便于保留时间切分调试语义。
 
 显式指定去重时间窗：
@@ -34,6 +40,12 @@ python scripts/run_taobao.py --epochs 5 --batch-size 256
 
 ```bash
 python scripts/run_taobao.py --max-rows 50000 --epochs 1 --batch-size 64 --device cpu
+```
+
+小样本正例过少时可临时启用自动正例权重；正式 CTR LogLoss/AUC 复现实验默认使用不加权 BCE：
+
+```bash
+python scripts/run_taobao.py --data-dir data/taobao_processed_2000_hist100k --epochs 3 --batch-size 128 --split-mode random --pos-weight-mode auto
 ```
 
 说明：训练脚本里的 `--max-rows` 同样会沿完整时间轴做等距抽样，避免小样本调试时验证集只落在最早几天。
@@ -59,6 +71,7 @@ python scripts/run_taobao.py ^
   --num-queries-per-seq 8 ^
   --num-non-seq-tokens 9 ^
   --d-model 128 ^
+  --field-embed-dim 16 ^
   --num-heads 4 ^
   --ffn-hidden 256 ^
   --hyformer-layers 4 ^

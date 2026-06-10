@@ -182,6 +182,16 @@ python scripts/preprocess_taobao.py
 python scripts/run_taobao.py --epochs 5 --batch-size 256
 ```
 
+For a small smoke test, build histories from a larger raw window and train on a small target sample:
+
+```bash
+python scripts/preprocess_taobao.py --max-raw-rows 100000 --max-rows 2000 --seq-len 50 --output-dir data/taobao_processed_2000_hist100k
+python scripts/run_taobao.py --data-dir data/taobao_processed_2000_hist100k --epochs 3 --batch-size 128 --split-mode random
+```
+
+The default loss is unweighted `BCEWithLogitsLoss`, which matches CTR LogLoss evaluation more closely. For tiny imbalanced smoke tests, `--pos-weight-mode auto` is available as a diagnostic option.
+The default `--field-embed-dim 16` is a small-data setting that keeps the HyFormer information flow intact while reducing sparse embedding parameters.
+
 ### Training with a specific sequence encoder
 
 ```bash

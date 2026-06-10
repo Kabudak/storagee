@@ -176,6 +176,7 @@ class TAACHyFormerClassifier(nn.Module):
         self.seq_len = seq_len
         self.num_sequences = num_sequences
         self.num_queries_per_seq = num_queries_per_seq
+        self.total_query_tokens = num_sequences * num_queries_per_seq
         self.d_model = d_model
         self.token_groups = token_groups
 
@@ -244,8 +245,8 @@ class TAACHyFormerClassifier(nn.Module):
             short_seq_len=short_seq_len,
         )
         self.head = nn.Sequential(
-            nn.LayerNorm(d_model),
-            nn.Linear(d_model, d_model),
+            nn.LayerNorm(d_model * 2),
+            nn.Linear(d_model * 2, d_model),
             nn.SiLU(),
             nn.Linear(d_model, num_classes),
         )
@@ -332,5 +333,6 @@ class TAACHyFormerClassifier(nn.Module):
         sequence_tokens, sequence_masks, pooled_sequences = self.build_sequence_tokens(seq_sparse, seq_dense, seq_mask)
         query_tokens = self.build_query_tokens(non_seq_tokens, pooled_sequences)
         boosted_tokens = self.backbone(query_tokens, non_seq_tokens, sequence_tokens, sequence_masks)
-        pooled = boosted_tokens.mean(dim=1)
-        return self.head(pooled)
+        query_repr = boosted_tokens[:, : self.total_query_tokens, :].mean(dim=1)
+        non_seq_repr = boosted_tokens[:, self.total_query_tokens :, :].mean(dim=1)
+        return self.head(torch.cat([query_repr, non_seq_repr], dim=-1))

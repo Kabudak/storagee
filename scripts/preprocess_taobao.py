@@ -290,9 +290,11 @@ def deduplicate_raw_sample(raw_sample: pd.DataFrame, dedup_window_sec: int) -> t
 def load_raw_data(data_dir: Path, dedup_window_sec: int, max_raw_rows: int | None = None) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[str, float]]:
     print("[1/5] 读取原始 CSV ...")
 
-    raw_sample = pd.read_csv(data_dir / "raw_sample.csv")
+    raw_sample = pd.read_csv(data_dir / "raw_sample.csv", nrows=max_raw_rows)
     ad_feature = pd.read_csv(data_dir / "ad_feature.csv")
     user_profile = pd.read_csv(data_dir / "user_profile.csv")
+    if max_raw_rows is not None:
+        print(f"  raw_sample smoke rows: {len(raw_sample):,}")
 
     raw_sample["time_stamp"] = raw_sample["time_stamp"].astype(np.int64)
     raw_sample["user"] = raw_sample["user"].astype(np.int64)

@@ -205,6 +205,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num-queries-per-seq", type=int, default=8)
     parser.add_argument("--num-non-seq-tokens", type=int, default=9)
     parser.add_argument("--d-model", type=int, default=128)
+    parser.add_argument("--field-embed-dim", type=int, default=16)
     parser.add_argument("--num-heads", type=int, default=4)
     parser.add_argument("--ffn-hidden", type=int, default=256)
     parser.add_argument("--hyformer-layers", type=int, default=4)
@@ -214,6 +215,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
+    parser.add_argument("--pos-weight-mode", choices=("none", "auto"), default="none")
     parser.add_argument("--val-ratio", type=float, default=0.2)
     parser.add_argument("--split-mode", choices=("time", "random"), default="time")
     parser.add_argument("--val-days", type=int, default=1)
@@ -308,12 +310,18 @@ def main() -> None:
         hyformer_layers=args.hyformer_layers,
         seq_encoder_type=args.seq_encoder_type,
         short_seq_len=args.short_seq_len,
+        field_embed_dim=args.field_embed_dim,
     ).to(args.device)
 
     train_labels = labels[train_idx]
     pos_count = int(train_labels.sum().item())
     neg_count = int(len(train_labels) - pos_count)
-    pos_weight = torch.tensor([neg_count / max(pos_count, 1)], dtype=torch.float32, device=args.device)
+    pos_weight_value = neg_count / max(pos_count, 1)
+    pos_weight = (
+        torch.tensor([pos_weight_value], dtype=torch.float32, device=args.device)
+        if args.pos_weight_mode == "auto"
+        else None
+    )
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
@@ -324,8 +332,14 @@ def main() -> None:
     print(f"  seq_sparse={tuple(seq_sparse.shape)}")
     print(f"  seq_dense={tuple(seq_dense.shape)}")
     print(f"  seq_mask={tuple(seq_mask.shape)}")
-    print(f"  train_pos_rate={pos_count / max(len(train_labels), 1) * 100:.2f}%  pos_weight={pos_weight.item():.2f}")
-    print(f"  d_model={args.d_model}  layers={args.hyformer_layers}  encoder={args.seq_encoder_type}")
+    if pos_weight is None:
+        print(f"  train_pos_rate={pos_count / max(len(train_labels), 1) * 100:.2f}%  pos_weight=none")
+    else:
+        print(f"  train_pos_rate={pos_count / max(len(train_labels), 1) * 100:.2f}%  pos_weight={pos_weight.item():.2f}")
+    print(
+        f"  d_model={args.d_model}  field_embed_dim={args.field_embed_dim} "
+        f"layers={args.hyformer_layers}  encoder={args.seq_encoder_type}"
+    )
 
     best_val_auc = float("-inf")
     best_epoch = 0
@@ -359,6 +373,11 @@ def main() -> None:
         },
         "best_epoch": best_epoch,
         "best_val_auc": best_val_auc,
+        "loss": {
+            "name": "BCEWithLogitsLoss",
+            "pos_weight_mode": args.pos_weight_mode,
+            "pos_weight_value": round(pos_weight_value, 6) if pos_weight is not None else None,
+        },
     }
     (args.output_dir / "run_metadata.json").write_text(
         json.dumps(run_meta, indent=2, ensure_ascii=False),

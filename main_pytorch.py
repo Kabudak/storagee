@@ -168,7 +168,8 @@ class QueryBoostMixer(nn.Module):
         self.mixer_dim = math.ceil(d_model / total_tokens) * total_tokens
         self.in_proj = nn.Identity() if self.mixer_dim == d_model else nn.Linear(d_model, self.mixer_dim)
         self.out_proj = nn.Identity() if self.mixer_dim == d_model else nn.Linear(self.mixer_dim, d_model)
-        self.norm = nn.LayerNorm(self.mixer_dim)
+        self.token_norm = nn.LayerNorm(self.mixer_dim)
+        self.channel_norm = nn.LayerNorm(self.mixer_dim)
         hidden_dim = max(ffn_hidden, self.mixer_dim)
         self.ffn = nn.Sequential(
             nn.Linear(self.mixer_dim, hidden_dim),
@@ -226,11 +227,10 @@ class QueryBoostMixer(nn.Module):
         residual = x
         x = self.in_proj(x)
         # Token Mixing + 子空间 MLP
-        x = self.token_mix(x)
+        x = x + self.token_mix(self.token_norm(x))
         # Per-Token FFN
-        x = self.ffn(self.norm(x))
-        x = self.out_proj(x)
-        return residual + x
+        x = x + self.ffn(self.channel_norm(x))
+        return residual + self.out_proj(x)
 
 
 class HyFormerLayer(nn.Module):

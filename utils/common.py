@@ -3,10 +3,15 @@ from __future__ import annotations
 import argparse
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import torch
-from datasets import Dataset
+
+
+class RowDataset(Protocol):
+    def __len__(self) -> int: ...
+
+    def __getitem__(self, index: int) -> dict[str, Any]: ...
 
 
 def set_seed(seed: int) -> None:
@@ -38,6 +43,6 @@ def json_ready_args(args: argparse.Namespace) -> dict[str, Any]:
     return payload
 
 
-def take_rows(dataset: Dataset, max_rows: int | None) -> list[dict[str, Any]]:
+def take_rows(dataset: RowDataset, max_rows: int | None) -> list[dict[str, Any]]:
     total = len(dataset) if max_rows is None else min(len(dataset), max_rows)
     return [dataset[idx] for idx in range(total)]
